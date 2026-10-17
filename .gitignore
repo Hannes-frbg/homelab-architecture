@@ -1,0 +1,92 @@
+# ==============================================================================
+# PROXMOX HOMELAB — SICHERHEITS- & GITIGNORE-REGELWERK
+# ==============================================================================
+
+# --- 1. Log-Dateien & Runtime-Dumps ---
+*.log
+*.log.*
+logs/
+*.out
+*.err
+*.tmp
+*.bak
+*.swp
+
+# --- 2. Secrets, Passwörter & Umgebungsvariablen ---
+*.env
+*.env.*
+.env
+*secret*
+*password*
+*pass*.bat
+askpass*.bat
+credentials.json
+token
+*.token
+
+# --- 3. SSH-Keys, Zertifikate & Kryptografische Schlüssel ---
+id_rsa
+id_rsa.pub
+id_ed25519
+id_ed25519.pub
+*.pem
+*.key
+*.crt
+*.pfx
+*.p12
+authorized_keys
+known_hosts
+setup_ssh_trust.py
+
+# --- 4. Minecraft- & Gaming-Spezifische Secrets & Daten ---
+forwarding.secret
+ops.json
+whitelist.json
+usercache.json
+banned-ips.json
+banned-players.json
+playerdata/
+stats/
+world/
+world_nether/
+world_the_end/
+
+# --- 5. Two-Factor Authentication (2FA / TOTP) & Tokens ---
+*totp*
+tfa.cfg
+
+# --- 6. Python, Node.js & Tooling Caches ---
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+node_modules/
+package-lock.json
+
+# --- 7. Temporary Test, Deployment & Scratch Files ---
+/*.py
+/*.json
+raw_dumps/
+Messdaten_Benchmark_Audit/
+scratch/
+scratch_*.py
+test_*.py
+test_*.js
+swarm_*.js
+run_host_cmd.py
+run_ssh.py
+pve_ssh.py
+deploy_*.py
+setup_*.py
+step*.py
+update_*.py
+check_*.py
+apply_*.py
+fix_*.py
+*.sh
+
+# --- 8. OS-Spezifische Metadaten ---
+.DS_Store
+Thumbs.db
+desktop.ini

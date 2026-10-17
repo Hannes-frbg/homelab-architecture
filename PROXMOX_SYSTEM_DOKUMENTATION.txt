@@ -1,0 +1,590 @@
+================================================================================
+          PROXMOX VE VOLLSTÄNDIGE SYSTEMDOKUMENTATION & ARCHITEKTUR-AUDIT
+================================================================================
+Datum:          17. Oktober 2026
+Systeme:        PVE 1 (Core Compute: 192.168.178.169)
+                PVE 2 (Backup & Utility: 192.168.178.2)
+Verfasser:      Antigravity AI Infrastructure Audit
+Dokumentenart:  Vollständige technische Systemzusammenfassung & Optimierungsplan
+================================================================================
+
+INHALTSVERZEICHNIS
+--------------------------------------------------------------------------------
+1. EXECUTIVE SUMMARY & SCHNELLÜBERSICHT
+2. HARDWARE-, STORAGE- & SYSTEM-STATUS BEIDER NODES
+   2.1. Node 1: PVE 1 (192.168.178.169) - Core Node
+   2.2. Node 2: PVE 2 (192.168.178.2) - Backup & Utility Node
+   2.3. Detaillierte Übersicht aller VMs und LXC-Container
+3. SECURITY-ANALYSE & SCHWACHSTELLEN-AUDIT
+   3.1. Proxmox-Firewall Status
+   3.2. SSH- und Root-Zugriff
+   3.3. Web-GUIs & 2FA-Status auf Hypervisor-Ebene
+   3.4. Sicherheitsanalyse des Auth-Portals (CT 100)
+   3.5. Risiken des aktuellen flachen Netzwerks (Flat Network)
+4. BACKUP-MANAGEMENT & ZUKUNFTSSTRATEGIE GOOGLE DRIVE
+   4.1. Ist-Zustand: 2-stufiges Backup-Verfahren (PBS & Local HDD)
+   4.2. Analyse der aktuellen Backup-Jobs & Speicherbelegung
+   4.3. Identifizierte Lücken im Backup-Konzept
+   4.4. Zukunftsoption: Offsite-Backup zu Google Drive (Konzept & Umsetzung)
+5. MINECRAFT-INFRASTRUKTUR & ARCHITEKTUR
+   5.1. Gesamtarchitektur (VM 110: Pelican Server)
+   5.2. Netzwerk-Topologie: Velocity Reverse-Proxy & Backend-Server
+   5.3. Performance-Messdaten & Benchmark-Ergebnisse (Audit-Zusammenfassung)
+   5.4. Altlast: Standalone VM 104 ("Minecraftserver")
+6. AUTHENTICATION MIT GOOGLE AUTHENTICATOR (TOTP) & CLOUDFLARE GATEWAY
+   6.1. Technischer Aufbau des Auth-Portals (CT 100 auf PVE 2)
+   6.2. Funktionsweise des Google Authenticators (RFC 6238 TOTP)
+   6.3. Anbindung an Cloudflare Tunnel
+   6.4. Reverse-Proxy & Header-Manipulation
+7. ARCHITEKTUR-VERBESSERUNGEN & KONKRETES VLAN-KONZEPT
+   7.1. Schwachstellen der aktuellen Infrastruktur
+   7.2. Soll-Architektur mit 4 isolierten VLANs
+   7.3. Umsetzung mit Proxmox VLAN-Aware Linux Bridge & FRITZ!Box
+   7.4. Konfigurationsbeispiel (/etc/network/interfaces)
+8. PRIORISIERTE HANDLUNGSEMPFEHLUNGEN (ROADMAP)
+
+
+================================================================================
+1. EXECUTIVE SUMMARY & SCHNELLÜBERSICHT
+================================================================================
+
+Die aktuelle Infrastruktur besteht aus zwei physisch getrennten Proxmox VE-
+Installationen im lokalen Subnetz 192.168.178.0/24 (FRITZ!Box Gateway 192.168.178.1):
+
+1. PVE 1 (192.168.178.169):
+   - Rolle: Primärer Hypervisor für produktive Workloads (High-Performance Compute).
+   - CPU: AMD Ryzen 5 5600GT (6 Kerne, 12 Threads, bis zu 4.65 GHz Boost).
+   - RAM: 32 GB DDR4 (30 GiB adressierbar, ~21 GiB aktuell belegt).
+   - Storage: 1 TB NVMe/SATA SSD (ZFS Pool 'ssd-1tb') + 1 TB WD HDD (ZFS Pool 'Hdd')
+     + 256 GB System-SSD (LVM-Thin 'local-lvm').
+   - Hauptdienste:
+     * VM 110 (pelican-server): 10 vCPUs, 16 GB RAM, Pelican Game Panel + Wings
+       mit Docker-Containern für Velocity Proxy (Port 25565), Purpur SMP Main
+       (Port 25566) und Test-Server (Port 25567).
+     * VM 104 (Minecraftserver): Ältere monolithische Instanz (250 GB Disk, 12 GB RAM).
+     * VM 106 & VM 102: Home Assistant OS Instanzen.
+     * VM 100 (dc-bot), VM 105 (hermes).
+     * CT 101 (status-dashboard), CT 200 (openspeedtest).
+
+2. PVE 2 (192.168.178.2):
+   - Rolle: Dedizierter Backup-Server, Sicherheits-Gateway & Utility Node.
+   - CPU: Intel Core i5-7500T (4 Kerne, 4 Threads @ 2.70 GHz, 35W Stromspar-CPU).
+   - RAM: 8 GB DDR4 (7.6 GiB adressierbar, ~1.8 GiB belegt).
+   - Storage: 480 GB Kingston SSD (LVM-Thin, davon 280 GB ext4 für PBS Datastore).
+   - Hauptdienste:
+     * Nativer Proxmox Backup Server (PBS 4.2.8) auf Port 8007 mit Deduplizierung.
+     * CT 100 (auth-portal): Node.js 2FA Gateway mit Google Authenticator (TOTP)
+       und Cloudflare Tunnel Client für weltweiten sicheren Zugriff.
+
+Beide Nodes arbeiten derzeit als eigenständige Standalone-Hypervisoren (kein
+Corosync-Cluster), was für ein Setup mit 2 Nodes ohne Quorum-Device (QDevice)
+auch dringend empfohlen ist, um Split-Brain-Situationen zu vermeiden.
+
+
+================================================================================
+2. HARDWARE-, STORAGE- & SYSTEM-STATUS BEIDER NODES
+================================================================================
+
+2.1. Node 1: PVE 1 (192.168.178.169) - Core Node
+--------------------------------------------------------------------------------
+- Proxmox-Version:      Proxmox VE 9.1.1 (pve-manager/9.1.1/42db4a6cf33dac83)
+- Kernel:               Linux 6.17.2-1-pve (SMP PREEMPT_DYNAMIC, x86_64)
+- CPU:                  AMD Ryzen 5 5600GT with Radeon Graphics
+                        6 physische Kerne / 12 Threads
+                        Basistakt: 3.60 GHz, Boost: bis zu 4.65 GHz
+                        Governor: performance (auf allen 12 Threads aktiv)
+- Arbeitsspeicher:      Total: 30 GiB | Belegt: 21 GiB | Frei: 4.0 GiB | Cache: 6.2 GiB
+                        Swap: 8.0 GiB (vollständig frei: 0 Byte Swap-Nutzung)
+- Netzwerkschnittstelle: Realtek RTL8168h Gigabit Ethernet (r8169 Treiber)
+                        Bridge 'vmbr0' auf 192.168.178.169/24, Gateway 192.168.178.1
+- Storage-Architektur:
+  * sda (256 GB SSD):   LVM2 Volume Group 'pve'
+                        - pve-root (68 GB ext4, 51% belegt)
+                        - pve-swap (8 GB)
+                        - local-lvm (LVM-Thin Pool 148 GB, 11% belegt)
+  * sdb (1 TB SSD):     ZFS Pool 'ssd-1tb' (943 GB raw, 486 GB belegt = 51.5%)
+                        Beherbergt alle virtuellen High-Performance Disks:
+                        - VM 104 Disk (250 GB)
+                        - VM 110 Disk (60 GB)
+                        - VM 105 Disk (50 GB)
+                        - VM 102 & 106 Disks (je 32 GB)
+                        Scrub-Status: Fehlerfrei (0 Errors, zuletzt 11.10.2026)
+  * sdc (1 TB HDD):     Western Digital WD10JMVW, ZFS Pool 'Hdd' (943 GB raw, 18.6% belegt)
+                        Enthält Mountpoint '/Hdd/backups' (Directory Pool 'hdd-backup')
+                        Beherbergt die täglichen VZDump Zstandard-Archive (168 GB belegt)
+  * pbs-backup:         Remote PBS Client Storage angebunden an 192.168.178.2:8007
+
+2.2. Node 2: PVE 2 (192.168.178.2) - Backup & Utility Node
+--------------------------------------------------------------------------------
+- Proxmox-Version:      Proxmox VE 9.2.2 (pve-manager/9.2.2/b9984c6d90a4bd80)
+- Kernel:               Linux 7.0.2-6-pve (x86_64)
+- CPU:                  Intel Core i5-7500T @ 2.70GHz (Kaby Lake)
+                        4 physische Kerne / 4 Threads (35 Watt TDP)
+                        Load Average: ~0.10 (sehr effizienter Idle-Betrieb)
+- Arbeitsspeicher:      Total: 7.6 GiB | Belegt: 1.8 GiB | Cache: 5.8 GiB | Frei: ~400 MiB
+                        Swap: 7.6 GiB (4.5 MiB belegt)
+- Netzwerkschnittstelle: Realtek RTL8168h Gigabit Ethernet (r8169 Treiber)
+                        Bridge 'vmbr0' auf 192.168.178.2/24, Gateway 192.168.178.1
+- Storage-Architektur:
+  * sda (480 GB SSD):   Kingston SA400S37480G SATA SSD
+                        - pve-root (96 GB ext4, 9 GB belegt = 11%)
+                        - pve-swap (7.6 GB)
+                        - LVM-Thin Pool 'data' (320 GB raw)
+                          > pve-pbs--storage: 280 GB ext4 Volume, gemountet auf
+                            '/mnt/pbs-storage' für Proxmox Backup Server (72 GB belegt)
+                          > pve-vm--100--disk--0: 8 GB ext4 Volume für CT 100 Auth-Portal
+- Integrierter PBS:     Proxmox Backup Server Daemon (PBS 4.2.8) lauscht auf Port 8007.
+                        Datastore: 'backups' -> Pfad: /mnt/pbs-storage
+
+2.3. Detaillierte Übersicht aller VMs und LXC-Container
+--------------------------------------------------------------------------------
+NODE 1 (PVE 1 - 192.168.178.169):
++-----+-------------------+---------+--------+---------+-----------+-----------------------------------+
+| ID  | Name              | Typ     | Status | vCPUs   | RAM       | Speicherort & Zweck               |
++-----+-------------------+---------+--------+---------+-----------+-----------------------------------+
+| 100 | dc-bot            | QEMU VM | Läuft  | 1       | 1.0 GB    | local-lvm (32 GB) - Discord Bot   |
+| 102 | haos-16.3         | QEMU VM | Läuft  | 2       | 3.0 GB    | ssd-1tb (32 GB) - Home Assistant  |
+|     |                   |         |        |         |           | (mit ConBee II USB Passthrough)   |
+| 103 | Pedal             | QEMU VM | Stop   | 2       | 3.0 GB    | ssd-1tb (32 GB) - Inaktiv         |
+| 104 | Minecraftserver   | QEMU VM | Läuft  | 6       | 12.0 GB   | ssd-1tb (250 GB) - Monolithisches |
+|     |                   |         |        |         |           | Altsystem vor Pelican-Migration   |
+| 105 | hermes            | QEMU VM | Läuft  | 2       | 2.0 GB    | ssd-1tb (50 GB) - Linux VM        |
+| 106 | homeassistant     | QEMU VM | Läuft  | 2       | 3.0 GB    | ssd-1tb (32 GB) - Neuere HA-VM    |
+|     |                   |         |        |         |           | (Community-Script, QEMU-Agent an) |
+| 110 | pelican-server    | QEMU VM | Läuft  | 10      | 16.0 GB   | ssd-1tb (60 GB) - HAUPTSERVER:    |
+|     |                   |         |        |         |           | Pelican Panel, Wings & Minecraft  |
+| 101 | status-dashboard  | LXC CT  | Läuft  | 2       | 1.0 GB    | local-lvm (8 GB) - IP: .99:3000   |
+| 200 | openspeedtest     | LXC CT  | Läuft  | 2       | 1.0 GB    | local-lvm (8 GB) - IP: .44        |
++-----+-------------------+---------+--------+---------+-----------+-----------------------------------+
+
+NODE 2 (PVE 2 - 192.168.178.2):
++-----+-------------------+---------+--------+---------+-----------+-----------------------------------+
+| ID  | Name              | Typ     | Status | vCPUs   | RAM       | Speicherort & Zweck               |
++-----+-------------------+---------+--------+---------+-----------+-----------------------------------+
+| 100 | auth-portal       | LXC CT  | Läuft  | 2       | 1.0 GB    | local-lvm (8 GB) - IP: .101       |
+|     |                   |         |        |         |           | Node.js 2FA Gateway & Cloudflare  |
+| --- | Host: PBS-Dienst  | Nativ   | Läuft  | 4 (Host)| 8 GB Host | /mnt/pbs-storage (280 GB LVM)     |
+|     |                   |         |        |         |           | Proxmox Backup Server Port 8007   |
++-----+-------------------+---------+--------+---------+-----------+-----------------------------------+
+
+
+================================================================================
+3. SECURITY-ANALYSE & SCHWACHSTELLEN-AUDIT
+================================================================================
+
+3.1. Proxmox-Firewall Status
+--------------------------------------------------------------------------------
+- Status auf beiden Nodes: "Status: disabled/running"
+- Sowohl auf PVE 1 als auch auf PVE 2 ist die Cluster-/Datacenter-Firewall
+  vollständig DEAKTIVIERT (`/etc/pve/firewall/cluster.fw` ist leer).
+- Folge: Alle Hosts und Ports im Subnetz 192.168.178.0/24 sind ohne Filterung
+  untereinander erreichbar. Ein manipuliertes Gastsystem kann jeden Dienst auf
+  dem Hypervisor ansprechen.
+
+3.2. SSH- und Root-Zugriff
+--------------------------------------------------------------------------------
+- Beide Nodes akzeptieren direkte Root-Logins via SSH mit Standard-Passwort:
+  `root` / `ep123-washout`.
+- `PasswordAuthentication yes` ist auf beiden Hosts aktiv.
+- Es gibt keinen Schutz durch Fail2ban auf den Proxmox-Hosts. Sollte ein Gerät im
+  LAN kompromittiert werden, kann das Root-Passwort per Brute-Force attackiert werden.
+
+3.3. Web-GUIs & 2FA-Status auf Hypervisor-Ebene
+--------------------------------------------------------------------------------
+- Proxmox VE Web-GUI (Port 8006) auf beiden Nodes:
+  In `/etc/pve/tfa.cfg` ist KEINE native Zwei-Faktor-Authentifizierung hinterlegt!
+- Zwar existiert das separate "Auth-Portal" (CT 100) mit Google Authenticator,
+  wer jedoch im lokalen WLAN/LAN direkt `https://192.168.178.169:8006` oder
+  `https://192.168.178.2:8006` aufruft, kann sich OHNE 2FA mit dem Root-Passwort
+  einloggen. Das Auth-Portal schützt somit aktuell nur den externen Zugriff via
+  Cloudflare, schützt aber nicht gegen Angriffe aus dem internen Netz.
+
+3.4. Sicherheitsanalyse des Auth-Portals (CT 100 auf PVE 2)
+--------------------------------------------------------------------------------
+- Das Auth-Portal (/opt/auth-portal/server.js) ist eine saubere Eigenentwicklung
+  auf Basis von Express, `otplib` (RFC 6238 TOTP) und `http-proxy-middleware`.
+- KRITISCHE SCHWACHSTELLE IM DATEISYSTEM:
+  In der Konfigurationsdatei `/opt/auth-portal/data/config.json` ist das Passwort
+  neben dem Bcrypt-Hash im KLARTEXT hinterlegt:
+  `"plainDefault": "ep123-washout"`
+  Dies sollte umgehend bereinigt werden, damit kein lesbares Passwort im Dateisystem liegt.
+- AUSHEBELUNG VON SICHERHEITS-HEADERN:
+  In `server.js` werden beim Durchreichen der Web-Oberflächen gezielt Header gelöscht:
+  `delete proxyRes.headers['x-frame-options'];`
+  `delete proxyRes.headers['content-security-policy'];`
+  Grund: Damit Proxmox und Home Assistant im Portal-Iframe gerendert werden können.
+  Risiko: Ermöglicht theoretisch Clickjacking-Angriffe, falls die Portal-Session
+  in einem bösartigen Browser-Tab gekapert wird.
+
+3.5. Risiken des aktuellen flachen Netzwerks (Flat Network)
+--------------------------------------------------------------------------------
+- Alle Systeme befinden sich in einer einzigen Broadcast-Domäne:
+  * Hypervisor-Management (PVE 1, PVE 2, PBS)
+  * Öffentliche Gaming-Dienste (Minecraft, Pelican)
+  * Smart-Home-Komponenten (Cams, Thermostate, Home Assistant)
+  * Private Client-Rechner, Smartphones, WLAN-Gäste
+- Wenn beispielsweise eine Schwachstelle in einem Minecraft-Plugin (Log4j o. ä.)
+  oder in einer Webanwendung ausgenutzt wird, befindet sich der Angreifer sofort
+  im selben Netz wie die Hypervisor-Verwaltung und die Smart-Home-Kameras.
+
+
+================================================================================
+4. BACKUP-MANAGEMENT & ZUKUNFTSSTRATEGIE GOOGLE DRIVE
+================================================================================
+
+4.1. Ist-Zustand: 2-stufiges Backup-Verfahren (PBS & Local HDD)
+--------------------------------------------------------------------------------
+Aktuell verfügt das System über ein sehr gutes, 2-stufiges lokales Backup-Konzept:
+
+1. STUFE 1: Proxmox Backup Server (PBS) - Täglich um 02:00 Uhr
+   - Storage-Ziel: 'pbs-backup' auf PVE 2 (192.168.178.2:8007)
+   - Gesicherte VMs: VM 100 (dc-bot), VM 104 (Minecraftserver),
+     VM 106 (homeassistant), VM 110 (pelican-server)
+   - Modus: Snapshot via QEMU Dirty-Bitmaps (inkrementell, block-basiert).
+   - Deduplizierung: Extrem effizient; geänderte Daten werden in 4 MB Chunks zerlegt.
+   - Pruning-Regeln: 7 tägliche, 4 wöchentliche, 1 monatliches Backup.
+   - Wartung: Täglich um 04:00 Uhr läuft die automatische Garbage Collection auf PVE 2.
+   - Benachrichtigung: E-Mail bei Fehlern an `han2612@gmx.de`.
+
+2. STUFE 2: Lokaler VZDump HDD-Dump - Täglich um 03:30 Uhr
+   - Storage-Ziel: 'hdd-backup' (/Hdd/backups auf ZFS Pool 'Hdd' auf PVE 1)
+   - Gesicherte VMs: VM 100, 102, 104, 105, 106, 110
+   - Modus: Snapshot, Kompression via Zstandard (`.vma.zst`)
+   - Speicherbelegung im Ordner /Hdd/backups/dump:
+     * VM 104 (Minecraftserver): ~61 GB pro Archiv (Riesiges Datenaufkommen!)
+     * VM 105 (hermes):          ~8.7 GB pro Archiv
+     * VM 100 (dc-bot):          ~5.7 GB pro Archiv
+     * VM 110 (pelican-server):  ~3.8 GB pro Archiv (Kompakt & effizient)
+     * VM 102 (haos-16.3):       ~3.3 GB pro Archiv
+     * VM 106 (homeassistant):   ~2.3 GB pro Archiv
+     Gesamtbelegung auf der HDD: ~168 GB
+
+4.2. Identifizierte Lücken im Backup-Konzept
+--------------------------------------------------------------------------------
+1. Fehlende Sicherung von PVE 2 & CT 100:
+   - Weder PVE 2 noch der Container CT 100 (Auth-Portal) werden gesichert.
+   - Die Konfiguration des Proxmox Backup Servers (/etc/proxmox-backup) liegt
+     nur auf PVE 2 ohne externes Backup.
+2. Fehlende Sicherung von CT 101 (status-dashboard) und CT 200 (openspeedtest).
+3. Verstoß gegen die 3-2-1-Backup-Regel (Kein Offsite-Speicher):
+   - 3 Kopien der Daten: Vorhanden (Produktiv, Lokale HDD, PBS).
+   - 2 verschiedene Medien: Vorhanden (SSD & HDD).
+   - 1 Kopie an einem externen Standort (Offsite): FEHLT AKTUELL KOMPLETT!
+   - Da PVE 1 und PVE 2 im selben Gebäude/Haushalt stehen, führt ein lokaler Schaden
+     (Überspannung durch Blitzschlag, Wohnungsbrand, Diebstahl, Wasserschaden) zum
+     vollständigen Totalverlust aller Produktivdaten UND aller Backups!
+
+4.3. Zukunftsoption: Offsite-Backup zu Google Drive
+--------------------------------------------------------------------------------
+[HINWEIS ZUR ZUKÜNFTIGEN UMSETZUNG]:
+Wie im Prompt angefragt, ist Google Drive aktuell noch nicht aktiv angebunden,
+soll aber in Zukunft als sichere Offsite-Kopie integriert werden.
+
+WARUM PROXMOX NICHT DIREKT MIT GOOGLE DRIVE SPRECHEN KANN:
+Weder Proxmox VE noch Proxmox Backup Server unterstützen nativ proprietäre Cloud-APIs
+wie Google Drive. PBS setzt auf ein chunks-basiertes Dateisystem mit extrem vielen
+kleinen Dateien (in `.chunks/`), was direkte Google-Drive-Syncs über Web-Clients
+oft ausbremst oder API-Rate-Limits triggert.
+
+EMPFOHLENES ARCHITEKTUR-MODELL FÜR GOOGLE DRIVE:
+
+Modell A: PBS Chunk-Sync mit Rclone Crypt (Die eleganteste Lösung)
+- Ort der Ausführung: Direkt auf PVE 2 (dem Backup-Server).
+- Werkzeug: `rclone` mit aktiviertem `crypt`-Modul (Client-seitige AES-Verschlüsselung).
+- Ablauf:
+  1. Nach der täglichen Garbage Collection um 04:00 Uhr startet um 04:30 Uhr ein
+     systemd-Timer auf PVE 2.
+  2. `rclone sync /mnt/pbs-storage/ gdrive-crypt:pbs-backup/`
+  3. Da die Daten lokal vor dem Upload mit einem privaten Key verschlüsselt werden,
+     kann Google zu keinem Zeitpunkt Einblick in Passwörter, Datenbanken oder
+     Home-Assistant-Konfigurationen nehmen (Zero Knowledge).
+  4. Rclone lädt nur neu hinzugekommene oder geänderte Chunks hoch. Nach dem initialen
+     Voll-Upload beträgt das tägliche Upload-Volumen meist nur 200 MB bis 1 GB!
+
+Modell B: VZDump Hook-Script auf PVE 1 (Einfache Alternative)
+- Ort der Ausführung: PVE 1 (/usr/share/perl5/PVE/VZDump/ oder Hook-Script).
+- Ablauf:
+  1. Nach Fertigstellung jedes `.vma.zst`-Archivs ruft Proxmox ein Shell-Skript auf:
+     `rclone copy /Hdd/backups/dump/vzdump-qemu-110-*.vma.zst gdrive:pve-backups/`
+  2. Vorteil: Einzelne, sofort wiederherstellbare Komplett-Archive in Google Drive.
+  3. Nachteil: Größeres tägliches Upload-Volumen (mehrere Gigabyte pro Nacht).
+
+
+================================================================================
+5. MINECRAFT-INFRASTRUKTUR & ARCHITEKTUR
+================================================================================
+
+5.1. Gesamtarchitektur (VM 110: Pelican Server)
+--------------------------------------------------------------------------------
+Die gesamte Gaming-Infrastruktur wurde auf die moderne VM 110 (`pelican-server`,
+IP: 192.168.178.94) migriert:
+- Host-Ressourcen: 10 vCPUs (Typ `host`, volle AMD Ryzen 5600GT Instruktionen),
+  16 GB RAM, 60 GB VirtIO-SCSI SSD (ZFS Pool `ssd-1tb`).
+- Betriebssystem: Ubuntu 24.04 LTS (Noble Numbat).
+- Management-Software:
+  * Pelican Panel (moderner Pterodactyl-Fork): Nginx Webserver + PHP 8.3 FPM.
+  * Datenbank: MariaDB 10.11.14 (lokal auf VM 110).
+  * Node Daemon: Pelican Wings Daemon (steuert Docker-Container über das interne
+    Bridge-Netzwerk `pelican0` 172.18.0.0/16).
+
+5.2. Netzwerk-Topologie: Velocity Reverse-Proxy & Backend-Server
+--------------------------------------------------------------------------------
+Die Spieler betreten das Netzwerk nicht direkt auf dem Game-Server, sondern über
+einen zwischengeschalteten Reverse-Proxy:
+
+                                  [ Internet / LAN ]
+                                          |
+                                    Port 25565
+                                          v
+                   +-----------------------------------------------+
+                   |    CONTAINER 1: Velocity Proxy 3.4.0 (566)    |
+                   |       (ghcr.io/pelican-eggs/yolks:java_25)    |
+                   |   - Forwarding-Mode: 'modern'                 |
+                   |   - Shared Secret Token: 32-Byte Hex          |
+                   |   - libdeflate C-Kompression                  |
+                   +-----------------------------------------------+
+                                 /                 \
+                     Port 25566 /                   \ Port 25567
+                               v                     v
+       +-------------------------------+     +-------------------------------+
+       |   CONTAINER 2: SMP Main       |     |   CONTAINER 3: Test & Dev     |
+       | Purpur 26.3 (Build 2651)      |     | PaperMC 1.21.4 (Build 232)    |
+       | Java 25 LTS                   |     | Java 25 LTS                   |
+       | Survival, 50 Slots            |     | Creative World, 20 Slots      |
+       | Alternate Current, Lobotomize |     | Entwicklungs- und Test-Server |
+       +-------------------------------+     +-------------------------------+
+
+Sicherheitsmerkmal:
+Die Backend-Server (SMP und Test) laufen im `online-mode=false`, akzeptieren aber
+DANK MODERN VELOCITY FORWARDING ausschließlich Verbindungen, die das kryptografische
+Token (`forwarding.secret`) vom Velocity-Proxy mitbringen. Ein direktes Umgehen
+des Proxies durch unautorisierte Clients ist im Docker-Netzwerk ausgeschlossen.
+
+5.3. Performance-Messdaten & Benchmark-Ergebnisse (Audit-Zusammenfassung)
+--------------------------------------------------------------------------------
+Aus den vorliegenden, kryptografisch verifizierten Benchmark-Audits im Proxmox-
+Ordner (Messreihen mit 40 bis 200 simulierten Bot-Spielern):
+- Bis 110-120 Spieler zeitgleich: Absolut perfekte 20.0 TPS (Ticks Per Second)
+  bei einer MSPT (Millisekunden pro Tick) von unter 30 ms (Limit: 50 ms).
+- Bei 60 Spielern (typischer Community-Peak): Nur ca. 20 ms MSPT. Der AMD Ryzen
+  5600GT nutzt hierbei nur etwa 40 % seines Zeitbudgets pro Tick.
+- Spielbare Obergrenze: Bis zu 135 Spieler gleichzeitig bei >= 16 TPS.
+- CPU-Boost-Takt: Der Ryzen 5600GT taktet während Lastphasen auf bis zu 4.63 GHz
+  hoch, gestützt durch den `performance` CPU-Governor.
+
+5.4. Altlast: Standalone VM 104 ("Minecraftserver")
+--------------------------------------------------------------------------------
+- VM 104 läuft aktuell parallel weiter (PID 1951, Uptime ~17 Stunden).
+- Konfiguration: 6 Cores, 12 GB RAM, 250 GB Disk auf `ssd-1tb`.
+- Problem:
+  * Sie verbraucht 12 GB reservierten Arbeitsspeicher auf PVE 1.
+  * Ihr tägliches VZDump-Backup belegt 61 GB komprimierten Speicherplatz auf der
+    Backup-HDD und benötigt 15 Minuten Backup-Zeit.
+  * Da die produktive Minecraft-Umgebung vollständig in VM 110 (Pelican) läuft,
+    ist VM 104 redundant. Sie sollte nach Überprüfung etwaiger Alt-Welten archiviert
+    und gestoppt werden, um 12 GB RAM für PVE 1 freizugeben.
+
+
+================================================================================
+6. AUTHENTICATION MIT GOOGLE AUTHENTICATOR (TOTP) & CLOUDFLARE GATEWAY
+================================================================================
+
+6.1. Technischer Aufbau des Auth-Portals (CT 100 auf PVE 2)
+--------------------------------------------------------------------------------
+Auf PVE 2 läuft im LXC-Container CT 100 (`auth-portal`, IP 192.168.178.101) ein
+massgeschneidertes, hochmodernes Zugangsportal:
+- Laufzeitumgebung: Node.js (v20+) mit systemd Service `auth-portal.service`.
+- Web-Ports: Port 80 (HTTP) und Port 443 (HTTPS mit lokalem Zertifikat).
+- Bibliotheken: `express`, `otplib` (TOTP), `qrcode` (QR-Code-Erzeugung), `bcryptjs`,
+  `http-proxy-middleware`.
+
+6.2. Funktionsweise des Google Authenticators (RFC 6238 TOTP)
+--------------------------------------------------------------------------------
+1. Secret-Generierung:
+   Im Portal wird ein kryptografisches 32-Zeichen Base32-Secret generiert:
+   (Aktuell hinterlegt: `RYS5KSX6ELQUJE4W2T55UP2L2R23LKKL`).
+2. QR-Code-Bereitstellung:
+   Das Secret wird als URI formatiert:
+   `otpauth://totp/Proxmox%20Lab%20Gateway:admin?secret=...&issuer=Proxmox%20Lab%20Gateway`
+   und mittels `qrcode` als Bild im Setup-Dialog gerendert.
+3. Authentifizierung:
+   Der Google Authenticator (oder jede kompatible App wie Aegis, 2FAS, Bitwarden)
+   erzeugt alle 30 Sekunden einen 6-stelligen Zahlencode basierend auf dem Unix-Zeitstempel.
+4. Verifizierung:
+   Beim Login prüft `server.js` via `verifySync({ token: totpCode, secret })` mit
+   einem Toleranzfenster von +/- 1 Intervall (30 Sekunden Drift-Kompensation).
+5. Session-Verwaltung:
+   Bei erfolgreicher 2FA wird ein HTTP-only, signiertes Session-Cookie gesetzt:
+   `pmx_session`. Ohne dieses Cookie blockiert das Gateway alle Anfragen.
+
+6.3. Anbindung an Cloudflare Tunnel
+--------------------------------------------------------------------------------
+- Auf CT 100 ist der Dienst `cloudflared.service` aktiv.
+- Er baut einen ausgehenden verschlüsselten Tunnel (Port 7844 UDP/QUIC) zu den
+  weltweiten Cloudflare-Anycast-Servern auf.
+- Vorteil:
+  * Keine Portweiterleitung (Port Forwarding) in der FRITZ!Box erforderlich.
+  * Die öffentliche IP des Heimanschlusses bleibt verborgen.
+  * DDoS-Schutz und SSL-Zertifikate werden automatisch über Cloudflare bereitgestellt.
+
+6.4. Reverse-Proxy & Service-Umschaltung
+--------------------------------------------------------------------------------
+Nach bestandener Google Authenticator 2FA fungiert das Portal als zentraler
+Router zu allen internen Systemen:
+- PVE 1 Core Node:      https://192.168.178.169:8006
+- PVE 2 Backup Node:    https://192.168.178.2:8006
+- PBS Backup Server:    https://192.168.178.2:8007
+- Pelican Game Panel:   http://192.168.178.94:80
+- Home Assistant:       http://192.168.178.25:8123
+- Status Dashboard:     http://192.168.178.99:3000
+
+Über ein Cookie (`pmx_active_target`) kann der Nutzer im Dashboard mit einem Klick
+zwischen den Administrations-Oberflächen wechseln, ohne sich jeweils neu mit 2FA
+authentifizieren zu müssen.
+
+
+================================================================================
+7. ARCHITEKTUR-VERBESSERUNGEN & KONKRETES VLAN-KONZEPT
+================================================================================
+
+7.1. Schwachstellen der aktuellen Infrastruktur
+--------------------------------------------------------------------------------
+1. Fehlende Netzwerk-Segmentierung:
+   Minecraft-Traffic, Smart Home, Hypervisor-Management und Storage-Backups teilen
+   sich dieselbe Broadcast-Domain (192.168.178.0/24).
+2. Kein nativer 2FA-Schutz im LAN:
+   Das Auth-Portal schützt nur den Zugang über Cloudflare; im LAN sind alle Ports
+   direkt erreichbar.
+3. Unnötige Ressourcen-Verschwendung:
+   VM 104 belegt 12 GB RAM und 250 GB Disk als inaktives/redundantes Altsystem.
+   Zwei Home-Assistant-VMs (102 und 106) laufen parallel.
+4. Fehlende Offsite-Backups:
+   Kein Schutz vor physischen Katastrophen im Haus.
+
+7.2. Soll-Architektur mit 4 isolierten VLANs (802.1Q)
+--------------------------------------------------------------------------------
+Um die Sicherheit auf Enterprise-Niveau zu heben, sollte das Netzwerk in 4 VLANs
+unterteilt werden:
+
++---------+-------------------+-------------------+------------------------------------------+
+| VLAN-ID | Name              | Subnetz           | Zugewiesene Systeme / Interfaces         |
++---------+-------------------+-------------------+------------------------------------------+
+| VLAN 10 | MGMT (Management) | 10.10.10.0/24     | PVE 1 (10.10.10.2), PVE 2 (10.10.10.3),  |
+|         |                   |                   | PBS WebGUI, Switch-Management.           |
+|         |                   |                   | Zugriff NUR via VPN (z. B. WireGuard).   |
++---------+-------------------+-------------------+------------------------------------------+
+| VLAN 20 | DMZ / Gaming      | 10.10.20.0/24     | VM 110 (Pelican Panel & Minecraft),      |
+|         |                   |                   | CT 100 (Auth Portal & Cloudflare Tunnel).|
+|         |                   |                   | STRENG ISOLIERT vom internen LAN!        |
++---------+-------------------+-------------------+------------------------------------------+
+| VLAN 30 | IoT & Smart Home  | 10.10.30.0/24     | VM 106 (Home Assistant), WLAN-Kameras,   |
+|         |                   |                   | Smarthome-Bridges (Tado, Hue etc.).      |
+|         |                   |                   | Kein Zugriff auf Management oder Gaming. |
++---------+-------------------+-------------------+------------------------------------------+
+| VLAN 40 | Storage & Backup  | 10.10.40.0/24     | Dedizierter PBS-Datenaustausch zwischen  |
+|         |                   |                   | PVE 1 und PVE 2. Kein Internetzugriff.   |
++---------+-------------------+-------------------+------------------------------------------+
+
+7.3. Umsetzung mit Proxmox VLAN-Aware Linux Bridge & FRITZ!Box
+--------------------------------------------------------------------------------
+Das Problem mit Standard-FRITZ!Boxen:
+Eine FRITZ!Box unterstützt kein IEEE 802.1Q VLAN-Tagging auf den LAN-Ports
+(lediglich das Gastnetz auf LAN 4 ist isoliert).
+
+Zwei praxisnahe Lösungswege:
+
+LÖSUNGSWEG A: Hardware Managed Switch (Sehr günstig & optimal)
+- Anschaffung eines kleinen Smart-Managed-Switches (z. B. TP-Link TL-SG108E oder
+  Netgear GS308E, Kosten: ca. 25-35 Euro).
+- PVE 1 und PVE 2 werden an Trunk-Ports des Switches angeschlossen (VLANs 10, 20, 30, 40 tagged).
+- Der Router (FRITZ!Box) liefert Internet an einen Port.
+- Die VLAN-Isolation und das Routing zwischen den Zonen kann entweder über eine
+  OPNsense/pfSense-VM auf Proxmox abgewickelt werden oder über den Switch.
+
+LÖSUNGSWEG B: OPNsense / pfSense Virtual Router auf PVE 1 (Ohne Zusatzhardware)
+- Auf PVE 1 wird eine kleine VM mit OPNsense/pfSense eingerichtet (2 Cores, 2 GB RAM).
+- WAN-Interface der OPNsense hängt an `vmbr0` (verbunden mit FRITZ!Box 192.168.178.1).
+- LAN-Interface der OPNsense wird an eine interne VLAN-Aware Bridge (`vmbr1`) gebunden.
+- OPNsense fungiert als Router, Firewall und DHCP-Server für die 4 VLANs.
+- Keine Hardware-Kosten, maximale Kontrolle mit echten Firewall-Regeln (Stateful Packet Inspection).
+
+7.4. Konfigurationsbeispiel für /etc/network/interfaces auf Proxmox
+--------------------------------------------------------------------------------
+Um Proxmox für VLANs vorzubereiten, wird die Standard-Bridge auf "vlan-aware" umgestellt:
+
+```
+# Datei: /etc/network/interfaces (Beispiel PVE 1)
+auto lo
+iface lo inet loopback
+
+iface nic0 inet manual
+
+# VLAN-fähige Haupt-Bridge
+auto vmbr0
+iface vmbr0 inet manual
+	bridge-ports nic0
+	bridge-stp off
+	bridge-fd 0
+	bridge-vlan-aware yes
+	bridge-vids 10 20 30 40
+
+# Management-IP im isolierten VLAN 10
+auto vmbr0.10
+iface vmbr0.10 inet static
+	address 10.10.10.2/24
+	gateway 10.10.10.1
+	comment "PVE 1 Hypervisor Management"
+
+# Dediziertes Storage-Interface im VLAN 40 (für ultra-schnelle Backups)
+auto vmbr0.40
+iface vmbr0.40 inet static
+	address 10.10.40.2/24
+	comment "PBS Backup Interconnect"
+```
+
+In den Einstellungen der VMs (z. B. VM 110) muss dann im Proxmox Web-GUI unter
+"Hardware -> Network Device -> VLAN Tag" lediglich die Zahl `20` eingetragen werden,
+und die VM befindet sich automatisch im isolierten Gaming-VLAN!
+
+
+================================================================================
+8. PRIORISIERTE HANDLUNGSEMPFEHLUNGEN (ROADMAP)
+================================================================================
+
+PRIORITÄT 1 (Sofortige Sicherheitsmaßnahmen - Dauer: ~15 Minuten):
+1. Klartext-Passwort bereinigen:
+   In `/opt/auth-portal/data/config.json` auf CT 100 die Zeile `"plainDefault": "ep123-washout"`
+   entfernen.
+2. Natives 2FA in Proxmox aktivieren:
+   Im Web-GUI beider Nodes unter `Datacenter -> Two-Factor Authentication` TOTP
+   oder WebAuthn für den User `root@pam` erzwingen, damit auch interne LAN-Logins
+   abgesichert sind.
+3. SSH-Absicherung:
+   SSH-Schlüssel (`authorized_keys`) hinterlegen und Passwort-Authentifizierung
+   in `/etc/ssh/sshd_config` deaktivieren (`PasswordAuthentication no`).
+
+PRIORITÄT 2 (Ressourcen-Bereinigung & Speicheroptimierung - Dauer: ~30 Minuten):
+1. VM 104 konsolidieren / stilllegen:
+   Sicherstellen, dass alle benötigten Daten auf VM 110 liegen. Danach VM 104 stoppen.
+   Ersparnis: 12 GB RAM auf PVE 1 sofort frei, 6 vCPUs entlastet, 61 GB weniger Backup-Daten pro Nacht!
+2. Home-Assistant-Redundanz auflösen:
+   Prüfen, ob VM 102 (`haos-16.3`, mit Zigbee USB) oder VM 106 produktiv genutzt wird.
+   Die inaktive Instanz abschalten, um weitere 3 GB RAM und 32 GB SSD-Speicher zu sparen.
+3. Backup-Job erweitern:
+   CT 100 (Auth-Portal auf PVE 2) und CT 101/200 in den täglichen Backup-Plan aufnehmen!
+
+PRIORITÄT 3 (Zukunfts-Integration Google Drive - Dauer: ~1 Stunde):
+1. Rclone auf PVE 2 installieren (`apt install rclone`).
+2. Google Drive Remote anlegen (`rclone config`) und einen verschlüsselten Crypt-Ordner
+   definieren (`gdrive-crypt:`).
+3. Systemd-Timer auf PVE 2 einrichten, der jeden Morgen um 04:30 Uhr (nach der
+   PBS Garbage Collection) `/mnt/pbs-storage/` verschlüsselt zu Google Drive synchronisiert.
+
+PRIORITÄT 4 (Netzwerk-Isolation & VLANs):
+1. Entweder Managed Switch beschaffen oder OPNsense-VM aufsetzen.
+2. Proxmox-Bridges auf `bridge-vlan-aware yes` umstellen.
+3. Minecraft-Server und Auth-Portal in VLAN 20 (DMZ) isolieren.
+
+================================================================================
+ENDE DER DOKUMENTATION - Gespeichert im Proxmox-Projektordner
+================================================================================

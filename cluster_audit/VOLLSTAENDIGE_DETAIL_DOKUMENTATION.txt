@@ -1,0 +1,726 @@
+====================================================================================================
+PROXMOX CLUSTER & INFRASTRUKTUR — VOLLSTÄNDIGE DETAIL-DOKUMENTATION
+====================================================================================================
+Dokumentenversion: 1.0 (Final Comprehensive Deep Dive)
+Datum:             17. Oktober 2026
+Geprüfte Systeme:  Proxmox VE Node 1 (Core Compute: 192.168.178.169)
+                   Proxmox VE Node 2 (Backup & Gateway: 192.168.178.2)
+Projektordner:     C:\Users\han26\Documents\proxmox\Proxmox_Cluster_Documentation
+Ablagedatei:       VOLLSTAENDIGE_DETAIL_DOKUMENTATION.txt
+====================================================================================================
+
+
+INHALTSÜBERSICHT
+====================================================================================================
+KAPITEL 1: HIGH-LEVEL ARCHITEKTUR & VORWORT
+KAPITEL 2: HARDWARE-, KERNEL- & SYSTEM-SPEZIFIKATIONEN IM DETAIL (NODE 1 & NODE 2)
+KAPITEL 3: STORAGE-, PARTITIONS- & DATEISYSTEM-AUFBAU (ZFS, LVM-THIN, EXT4)
+KAPITEL 4: VOLLSTÄNDIGES INVENTAR ALLER VMS UND LXC-CONTAINER (PARAMETRISIERT)
+KAPITEL 5: DAS MINECRAFT- & GAMING-ÖKOSYSTEM (PELICAN, WINGS, VELOCITY, PURPUR)
+KAPITEL 6: AUTHENTICATION, GOOGLE AUTHENTICATOR (TOTP) & CLOUDFLARE GATEWAY
+KAPITEL 7: BACKUP-MANAGEMENT (PBS 4.2, VZDUMP-DUMP & ZUKUNFTS-INTEGRATION GOOGLE DRIVE)
+KAPITEL 8: SICHERHEITSAUDIT & IDENTIFIZIERTE SCHWACHSTELLEN
+KAPITEL 9: DETAILLIERTES VLAN- & NETZWERK-SEGMENTIERUNGSKONZEPT (SCHRITT FÜR SCHRITT)
+KAPITEL 10: CHRONOLOGISCHER MASSNAHMENPLAN (ROADMAP ZUR OPTIMIERUNG)
+
+
+====================================================================================================
+KAPITEL 1: HIGH-LEVEL ARCHITEKTUR & VORWORT
+====================================================================================================
+
+Die vorliegende Infrastruktur ist ein heterogenes 2-Node-Virtualisierungssystem auf Basis von
+Debian GNU/Linux 13 (Trixie) und Proxmox VE (PVE 9.1 bzw. 9.2). 
+
+ZENTRALE DESIGN-ENTSCHEIDUNG (STANDALONE STATT COROSYNC-CLUSTER):
+Beide Nodes werden bewusst als eigenständige Standalone-Hypervisoren betrieben. 
+Hintergrund: Ein klassischer Proxmox Corosync-Cluster benötigt für quorum-basierte Entscheidungen
+eine ungerade Anzahl von Stimmen (mindestens 3 Nodes oder 2 Nodes + externes QDevice). 
+Bei einem 2-Node-Cluster ohne QDevice führt der Ausfall eines einzelnen Nodes zum sofortigen Verlust
+des Quorums auf dem verbleibenden Node, wodurch VMs nicht mehr gestartet oder migriert werden können.
+Die Entkopplung in:
+- Node 1: Reine Compute- & Produktiv-Maschine
+- Node 2: Unabhängiger Backup-Server (PBS) und vorgelagertes Zugangs-Gateway (Auth-Portal)
+ist architektonisch extrem stabil und verhindert gegenseitige Blockaden.
+
+AKTUELLE TOPOLOGIE IM ÜBERBLICK:
+- Gateway / Router: FRITZ!Box (192.168.178.1, DNS / DHCP)
+- Subnetz: 192.168.178.0/24 (Flaches Netz, 254 Host-Adressen)
+- PVE 1 (Core): 192.168.178.169 (AMD Ryzen 5 5600GT, 32 GB RAM, 1 TB NVMe/SATA SSD + 1 TB HDD)
+- PVE 2 (Backup & Chill): 192.168.178.2 (Intel Core i5-7500T, 8 GB RAM, 480 GB SSD)
+- PBS (Proxmox Backup Server): Integriert auf PVE 2, lauscht nativ auf Port 8007
+- Auth-Portal: CT 100 auf PVE 2 (192.168.178.101), erreichbar via Cloudflare Tunnel
+- Gaming-Cluster: VM 110 auf PVE 1 (192.168.178.94), Docker-Stack mit Velocity & Purpur
+
+
+====================================================================================================
+KAPITEL 2: HARDWARE-, KERNEL- & SYSTEM-SPEZIFIKATIONEN IM DETAIL (NODE 1 & NODE 2)
+====================================================================================================
+
+----------------------------------------------------------------------------------------------------
+2.1. NODE 1: PVE 1 (192.168.178.169) — CORE COMPUTE HYPERVISOR
+----------------------------------------------------------------------------------------------------
+* Hostname:             pve.fritz.box
+* Betriebssystem:       Proxmox VE 9.1.1 (pve-manager/9.1.1/42db4a6cf33dac83)
+* Kernel-Version:       Linux 6.17.2-1-pve #1 SMP PREEMPT_DYNAMIC PMX (x86_64)
+* CPU-Architektur:      AMD Zen 3 (Cezanne / Barcelo Architektur, 7nm Fertigung)
+  - Modell:             AMD Ryzen 5 5600GT with Radeon Graphics
+  - Physische Kerne:    6 Kerne
+  - Logische Threads:   12 Threads (SMT aktiviert)
+  - Basistakt:          3.60 GHz
+  - Maximaler Boost:    4.65 GHz (gemessen bis zu 4635 MHz)
+  - Caches:             L1 Data: 192 KiB (6x 32 KiB)
+                        L1 Instruction: 192 KiB (6x 32 KiB)
+                        L2 Cache: 3 MiB (6x 512 KiB)
+                        L3 Cache: 16 MiB (Unified)
+  - Virtualisierung:    AMD-V (SVM aktiviert, Nested Virtualization unterstützt)
+  - CPU-Governor:       `performance` (erzwungen auf allen 12 logischen Kernen für
+                        minimale Latenzen und Vermeidung von Frequency-Scaling-Drops)
+* Physischer RAM:
+  - Gesamtkapazität:    32 GB DDR4 (30.0 GiB über Linux-Kernel adressierbar)
+  - Belegter Speicher:  ~21 GiB (Produktiv-Workload)
+  - Freier Speicher:    ~4.0 GiB (Puffer für dynamisches Ballooning)
+  - Buffers & Cache:    ~6.2 GiB (vor allem ZFS ARC Cache und Page Cache)
+  - Swap:               8.0 GiB Partition (/dev/mapper/pve-swap) -> 0 Byte belegt
+* Physisches Netzwerk:
+  - Controller:         Realtek Semiconductor RTL8168/8111 PCI-Express Gigabit Ethernet
+  - Kernel-Treiber:     r8169 (Firmware rtl8168h-2_0.0.2)
+  - Bus-Info:           0000:08:00.0
+  - MAC-Adresse:        d4:24:dd:75:b8:cb
+  - MTU:                1500
+
+----------------------------------------------------------------------------------------------------
+2.2. NODE 2: PVE 2 (192.168.178.2) — BACKUP, GATEWAY & UTILITY HYPERVISOR
+----------------------------------------------------------------------------------------------------
+* Hostname:             pve.fritz.box
+* Betriebssystem:       Proxmox VE 9.2.2 (pve-manager/9.2.2/b9984c6d90a4bd80)
+* Kernel-Version:       Linux 7.0.2-6-pve (x86_64)
+* CPU-Architektur:      Intel Kaby Lake (14nm Fertigung, Low-Power USFF / Tiny PC)
+  - Modell:             Intel Core i5-7500T CPU @ 2.70GHz
+  - Physische Kerne:    4 Kerne
+  - Logische Threads:   4 Threads (kein Hyperthreading)
+  - Basistakt:          2.70 GHz
+  - Turbotakt:          3.30 GHz
+  - TDP:                35 Watt (sehr geringer Stromverbrauch im 24/7-Betrieb)
+  - Lastdurchschnitt:   0.10, 0.06, 0.01 (ca. 95 % Idle-Reserven)
+  - Virtualisierung:    Intel VT-x / VMX aktiviert
+* Physischer RAM:
+  - Gesamtkapazität:    8 GB DDR4 (7.6 GiB nutzbar)
+  - Belegter Speicher:  ~1.8 GiB (PBS Daemons + CT 100 Auth-Portal)
+  - Freier Speicher:    ~400 MiB
+  - Buffers & Cache:    ~5.8 GiB (Linux File Cache für schnelle PBS-Chunk-Lookups)
+  - Swap:               7.6 GiB Partition (/dev/mapper/pve-swap) -> 4.5 MiB genutzt
+* Physisches Netzwerk:
+  - Controller:         Realtek Semiconductor RTL8168/8111 PCI-Express Gigabit Ethernet
+  - Kernel-Treiber:     r8169 (Firmware rtl8168h-2_0.0.2)
+  - Bus-Info:           0000:01:00.0
+  - MAC-Adresse:        10:e7:c6:02:74:71
+  - MTU:                1500
+
+
+====================================================================================================
+KAPITEL 3: STORAGE-, PARTITIONS- & DATEISYSTEM-AUFBAU (ZFS, LVM-THIN, EXT4)
+====================================================================================================
+
+----------------------------------------------------------------------------------------------------
+3.1. STORAGE-ARCHITEKTUR AUF NODE 1 (PVE 1)
+----------------------------------------------------------------------------------------------------
+Auf PVE 1 sind drei physische Datenträger mit unterschiedlichen Technologien im Einsatz:
+
+1. System-Datenträger (sda - 256 GB SSD):
+   - Partitionierung:
+     * sda1: 1007 KiB (BIOS boot partition)
+     * sda2: 1.0 GiB (EFI System Partition, vfat, gemountet unter /boot/efi)
+     * sda3: 237.5 GiB (LVM2 Physical Volume für Volume Group 'pve')
+   - LVM Logical Volumes:
+     * /dev/pve/root: 69.4 GiB (ext4, Root-Dateisystem '/', 51 % belegt = 33 GiB genutzt)
+     * /dev/pve/swap: 8.0 GiB (Linux Swap)
+     * /dev/pve/data: LVM-Thin Pool (141.2 GiB)
+       > vm-100-disk-0 (32 GiB für Discord-Bot VM 100)
+       > vm-200-disk-0 (8 GiB für OpenSpeedTest CT 200)
+
+2. High-Performance VM-Datenträger (sdb - 1 TB SSD):
+   - Typ: Dedicated ZFS Pool mit Namen `ssd-1tb`
+   - Kapazität: 931.5 GiB raw (Pool-Größe: 942.931.968 KiB)
+   - Belegung: 485.758.488 KiB (51.52 % belegt, 457.173.480 KiB frei)
+   - Integrität: Scrub fehlerfrei am 11.10.2026 durchgeführt (0 Errors, 4 Min. Laufzeit)
+   - Zvol Block Devices (Virtuelle Festplatten):
+     * zd0:  250 GiB -> VM 104 (`Minecraftserver` alt)
+     * zd16: 32 GiB  -> VM 102 (`haos-16.3` alt)
+     * zd32: 50 GiB  -> VM 105 (`hermes`)
+     * zd48: 60 GiB  -> VM 110 (`pelican-server` produktiv)
+     * zd80: 32 GiB  -> VM 103 (`Pedal` gestoppt)
+     * zd96: 32 GiB  -> VM 106 (`homeassistant` neu)
+
+3. Lokaler Backup-Datenträger (sdc - 1 TB HDD):
+   - Modell: Western Digital WD10JMVW-11AJGS4 (SATA HDD, 2.5", 5400 RPM)
+   - Typ: Dedicated ZFS Pool mit Namen `Hdd`
+   - Mountpoint: `/Hdd`
+   - Unterordner für Backups: `/Hdd/backups` (in Proxmox eingebunden als Directory-Storage `hdd-backup`)
+   - Belegung: 175.973.360 KiB (18.66 % belegt, 766.958.608 KiB frei)
+   - Inhalt: VZDump Zstandard-Archive (`.vma.zst`) der täglichen 03:30-Uhr-Sicherung (168 GB belegt)
+   - Scrub: Zuletzt am 11.10.2026 fehlerfrei durchgelaufen (1 Std. 54 Min. Dauer, 0 Fehler)
+
+4. Remote Storage-Einbindung (`pbs-backup`):
+   - Typ: Proxmox Backup Server Client (`pbs`)
+   - Server-Adresse: 192.168.178.2 (Node 2)
+   - Port: 8007
+   - Datastore: `backups`
+   - Benutzer: `pve-backup@pbs`
+   - TLS Fingerprint: 21:9a:a5:78:7e:24:80:eb:56:1f:b3:69:0f:66:c5:a4:da:c7:ff:98:99:26:83:66:a4:83:63:51:27:b8:76:e8
+
+----------------------------------------------------------------------------------------------------
+3.2. STORAGE-ARCHITEKTUR AUF NODE 2 (PVE 2)
+----------------------------------------------------------------------------------------------------
+Auf PVE 2 arbeitet eine einzelne Kingston SATA SSD:
+
+1. Datenträger sda (480 GB Kingston SA400S37480G):
+   - Partitionierung:
+     * sda1: 1007 KiB (BIOS boot partition)
+     * sda2: 1.0 GiB (EFI System Partition, vfat, gemountet unter /boot/efi)
+     * sda3: 446.1 GiB (LVM2 Physical Volume für Volume Group 'pve')
+   - LVM Logical Volumes:
+     * /dev/pve/root: 96 GiB (ext4, gemountet auf '/', nur 9.0 GiB genutzt = 11 %)
+     * /dev/pve/swap: 7.6 GiB (Linux Swap)
+     * /dev/pve/data: LVM-Thin Pool (320 GiB raw)
+       > pve-pbs--storage: 280 GiB Thin Volume, formatiert mit ext4, gemountet auf
+         `/mnt/pbs-storage` als primärer Speicher für den Proxmox Backup Server!
+         (Aktuell belegt: 72 GiB, frei: 201 GiB = 27 % Auslastung)
+       > pve-vm--100--disk--0: 8 GiB ext4 Thin Volume für CT 100 (`auth-portal`)
+
+
+====================================================================================================
+KAPITEL 4: VOLLSTÄNDIGES INVENTAR ALLER VMS UND LXC-CONTAINER (PARAMETRISIERT)
+====================================================================================================
+
+Nachfolgend sind alle auf beiden Nodes vorhandenen virtuellen Maschinen und Container mit ihren
+exakten Konfigurationsparametern aufgelistet:
+
+----------------------------------------------------------------------------------------------------
+4.1. VIRTUELLE MASCHINEN AUF NODE 1 (PVE 1)
+----------------------------------------------------------------------------------------------------
+
+1. VM 110: `pelican-server` (DER HAUPTSERVER FÜR MINECRAFT & GAMING)
+   * Status:            Running (PID 2305, Uptime > 17 Stunden)
+   * CPU:               10 vCPUs, Typ: `host` (voller Durchgriff auf alle AMD Zen3 Instruktionen)
+   * RAM:               16.384 MB (16 GB)
+   * Bootdisk:          60 GB auf `ssd-1tb` (SCSI-ID: scsi0, VirtIO SCSI Single, discard=on, iothread=1, ssd=1)
+   * Cloud-Init:        Aktiv über `ide2: ssd-1tb:vm-110-cloudinit`, User: `ubuntu`, IP via DHCP
+   * SSH-Schlüssel:     ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBBEp7rzfAWhlMFQT5yhCi+V00scDs/zYpXEyQiC+BVn han26@Hannes-PC
+   * Netzwerk:          VirtIO NIC, MAC: `bc:24:11:02:bc:ac`, Bridge: `vmbr0`, Firewall: 1
+   * IPv4-Adresse:      192.168.178.94 (DHCP Lease von FRITZ!Box)
+   * QEMU Guest Agent:  Aktiviert (`enabled=1, fstrim_cloned_disks=1`)
+
+2. VM 104: `Minecraftserver` (ALTSYSTEM VOR DER PELICAN-MIGRATION)
+   * Status:            Running (PID 1951, Uptime > 17 Stunden)
+   * CPU:               6 vCPUs, Typ: `host`
+   * RAM:               12.288 MB (12 GB)
+   * Bootdisk:          250 GB auf `ssd-1tb` (SCSI-ID: scsi0, VirtIO SCSI Single, iothread=1)
+   * Netzwerk:          VirtIO NIC, MAC: `bc:24:11:56:20:92`, Bridge: `vmbr0`, Firewall: 1
+   * QEMU Guest Agent:  Konfiguriert, antwortet aber nicht (Dienst im Gast gestoppt)
+   * Aktive Prozesse:   Lässt Cloudflare Warp/Tunnel im Hintergrund laufen
+   * Bewertung:         REDUNDANTES ALTSYSTEM. Bindet 12 GB RAM und erzeugt 60.5 GB VZDump-Ballast.
+
+3. VM 106: `homeassistant` (NEUE HOME ASSISTANT OS INSTANZ)
+   * Status:            Running (PID 2209, Uptime > 17 Stunden)
+   * CPU:               2 vCPUs, BIOS: OVMF (UEFI mit SecureBoot/EFI Disk auf `ssd-1tb`)
+   * RAM:               3.072 MB (3 GB)
+   * Bootdisk:          32 GB auf `ssd-1tb` (SCSI-ID: scsi0, discard=on, ssd=1)
+   * Netzwerk:          VirtIO NIC, MAC: `02:51:8c:22:0f:b6`, Bridge: `vmbr0`
+   * IPv4-Adresse:      192.168.178.93 (Home Assistant Web-GUI auf Port 8123)
+   * QEMU Guest Agent:  Aktiviert (führt bei Backups saubere `fs-freeze` & `fs-thaw` Befehle aus)
+   * Herkunft:          Erstellt über Proxmox Community Helper-Scripts
+
+4. VM 102: `haos-16.3` (ÄLTERE HOME ASSISTANT OS INSTANZ)
+   * Status:            Running (PID 1726, Uptime > 17 Stunden)
+   * CPU:               2 vCPUs, BIOS: OVMF (UEFI)
+   * RAM:               3.072 MB (3 GB)
+   * Bootdisk:          32 GB auf `ssd-1tb` (SCSI-ID: scsi0, discard=on, ssd=1)
+   * USB Passthrough:   `usb0: host=1cf1:0030` -> Dresdner Elektronik ConBee II Zigbee USB-Gateway!
+   * Netzwerk:          VirtIO NIC, MAC: `02:12:5c:4b:d0:e1`, Bridge: `vmbr0`
+   * IPv4-Adresse:      192.168.178.25
+   * WICHTIGER HINWEIS: Hier ist der physische Zigbee-Stick durchgeschleift!
+
+5. VM 100: `dc-bot` (DISCORD BOT SERVER)
+   * Status:            Running (PID 1654)
+   * CPU:               1 vCPU, Typ: `host`
+   * RAM:               1.000 MB (1 GB)
+   * Bootdisk:          32 GB auf `local-lvm` (LVM-Thin Pool)
+   * Netzwerk:          VirtIO NIC, MAC: `bc:24:11:3b:7a:02`, Bridge: `vmbr0`, Firewall: 1
+
+6. VM 105: `hermes`
+   * Status:            Running (PID 2121)
+   * CPU:               2 vCPUs, Typ: `host`
+   * RAM:               2.000 MB (2 GB)
+   * Bootdisk:          50 GB auf `ssd-1tb`
+   * Netzwerk:          VirtIO NIC, MAC: `bc:24:11:14:d5:5f`, Bridge: `vmbr0`, Firewall: 1
+
+7. VM 103: `Pedal`
+   * Status:            Stopped (Inaktiv)
+   * CPU:               2 Cores, 3 GB RAM, 32 GB Disk auf `ssd-1tb`
+
+----------------------------------------------------------------------------------------------------
+4.2. LXC-CONTAINER AUF NODE 1 (PVE 1)
+----------------------------------------------------------------------------------------------------
+
+1. CT 101: `status-dashboard`
+   * Status:            Running (Debian Linux, Unprivileged Container)
+   * CPU / RAM:         2 Cores / 1.024 MB RAM, 512 MB Swap
+   * RootFS:            8 GB auf `local-lvm`
+   * IPv4-Adresse:      192.168.178.99
+   * Funktion:          Observability & SLA Status Dashboard (Port 3000)
+
+2. CT 200: `openspeedtest`
+   * Status:            Running (Ubuntu Linux, Unprivileged Container)
+   * CPU / RAM:         2 Cores / 1.024 MB RAM, 512 MB Swap
+   * RootFS:            8 GB auf `local-lvm`
+   * IPv4-Adresse:      192.168.178.44
+   * Funktion:          Netzwerk-Bandbreitenmessung (OpenSpeedTest)
+
+----------------------------------------------------------------------------------------------------
+4.3. VIRTUELLE MASCHINEN & CONTAINER AUF NODE 2 (PVE 2)
+----------------------------------------------------------------------------------------------------
+
+1. CT 100: `auth-portal` (DAS ZENTRALE SICHERHEITS- UND 2FA-GATEWAY)
+   * Status:            Running (Ubuntu Linux, Unprivileged Container, nesting=1)
+   * CPU / RAM:         2 Cores / 1.024 MB RAM, 512 MB Swap
+   * RootFS:            8 GB auf `local-lvm`
+   * IPv4-Adresse:      192.168.178.101 (Feste IP mit Gateway 192.168.178.1)
+   * MAC-Adresse:       `bc:24:11:da:2c:1f`
+   * Aktive Dienste:    - `auth-portal.service`: Node.js Reverse-Proxy mit Google 2FA (Port 80/443)
+                        - `cloudflared.service`: Cloudflare Zero Trust Tunnel Client
+                        - `postfix`: Lokaler Mail-Transfer-Agent
+
+2. Nativer Host-Dienst: Proxmox Backup Server (PBS 4.2.8)
+   * Typ:               Direkt auf Debian/PVE Host installierter systemd-Daemon
+   * Units:             `proxmox-backup.service` & `proxmox-backup-proxy.service`
+   * Port:              8007 TCP (HTTPS)
+   * Datastore:         `backups` -> `/mnt/pbs-storage` (280 GB LVM Thin Volume)
+
+
+====================================================================================================
+KAPITEL 5: DAS MINECRAFT- & GAMING-ÖKOSYSTEM (PELICAN, WINGS, VELOCITY, PURPUR)
+====================================================================================================
+
+Die Gaming-Infrastruktur wurde vollständig auf VM 110 (`pelican-server`, IP 192.168.178.94)
+konsolidiert und arbeitet mit modernster Container-Orchestrierung.
+
+----------------------------------------------------------------------------------------------------
+5.1. MANAGEMENT-STACK (PELICAN PANEL & WINGS DAEMON)
+----------------------------------------------------------------------------------------------------
+- Pelican Panel:
+  * Architektur: Moderner, reaktiver Fork von Pterodactyl Panel (PHP 8.3 FPM + Nginx Webserver).
+  * Datenbank: MariaDB 10.11.14 (systemd: `mariadb.service`, lauscht lokal auf 127.0.0.1:3306).
+  * Web-Interface: Port 80 / 443 auf `192.168.178.94`.
+- Pelican Wings Daemon:
+  * Dienst: `wings.service` (Go-basierter Virtualisierungs-Agent).
+  * Docker-Integration: Verwaltet Container über das Docker-Subnetz `pelican0` (172.18.0.0/16).
+  * Volumes: Alle Serverdaten liegen persistent unter `/var/lib/pelican/volumes/<Server-UUID>/`.
+
+----------------------------------------------------------------------------------------------------
+5.2. DIE DREI AKTIVEN MINECRAFT-CONTAINER IM DETAIL
+----------------------------------------------------------------------------------------------------
+
+1. CONTAINER 1: VELOCITY REVERSE-PROXY (EINGANGS-GATEWAY)
+   * UUID:              `dd8e7e30-119b-4b54-b183-b3bf03125030`
+   * Docker-Image:      `ghcr.io/pelican-eggs/yolks:java_25`
+   * Ports:             192.168.178.94:25565 (TCP/UDP) & 8804 (Plugin-Query)
+   * Software:          Velocity 3.4.0 (Build 566) auf Java 25 LTS
+   * Konfiguration (`velocity.toml`):
+     - `bind = "0.0.0.0:25565"`
+     - `motd = "<#09add3>Pelican Network <#gray>| <#55ff55>SMP & Test"`
+     - `show-max-players = 100`
+     - `player-info-forwarding-mode = "modern"`
+     - `forwarding-secret-file = "forwarding.secret"`
+     - `compression-threshold = 256` (nutzt native libdeflate C-Optimierung)
+     - `login-ratelimit = 3000` (Schutz gegen Bot-Flooding)
+     - `failover-on-unexpected-server-disconnect = true`
+   * Routing-Ziele in Velocity:
+     - `smp`  -> `172.18.0.1:25566` (Default Try-Server)
+     - `test` -> `172.18.0.1:25567`
+
+2. CONTAINER 2: SMP MAIN SERVER (HAUPT-SPIELWELT)
+   * UUID:              `f32efbe5-1880-40b7-b848-2a1432de82f5`
+   * Docker-Image:      `ghcr.io/pelican-eggs/yolks:java_25`
+   * Port-Binding:      `192.168.178.94:25566` (intern auf Bridge `172.18.0.1:25566`)
+   * Software:          Purpur 26.3 (Build 2651, optimierter Paper/Pufferfish-Fork) auf Java 25 LTS
+   * Konfiguration (`server.properties` & `paper-global.yml`):
+     - `online-mode = false` (Absicherung erfolgt über Velocity Forwarding Secret!)
+     - `proxies.velocity.enabled = true`
+     - `proxies.velocity.online-mode = true`
+     - `proxies.velocity.secret = "forwarding.secret"` (Exakt synchronisiert mit dem Proxy)
+     - `max-players = 50`, `gamemode = survival`, `difficulty = hard`
+     - `view-distance = 10`, `simulation-distance = 8`
+   * Performance-Optimierungen im Kernel:
+     - Alternate Current (multithreadete Redstone-Berechnung statt Standard-Vanilla)
+     - Entity Lobotomizing (inaktive Mobs verbrauchen keine CPU-Tickzeit)
+     - Hopper Throttle (reduziert Trichter-Abfragen)
+
+3. CONTAINER 3: TEST & DEV SERVER
+   * UUID:              `524922d8-5ebf-4538-8344-8bfb8488c854`
+   * Docker-Image:      `ghcr.io/pelican-eggs/yolks:java_25`
+   * Port-Binding:      `192.168.178.94:25567` (intern auf Bridge `172.18.0.1:25567`)
+   * Software:          PaperMC 1.21.4 (Build 232) auf Java 25 LTS
+   * Modus:             Creative, 20 Slots, dient als Staging- und Testumgebung
+
+----------------------------------------------------------------------------------------------------
+5.3. BENCHMARK- & PERFORMANCE-ERGEBNISSE AUS DEN AUDIT-DATEN
+----------------------------------------------------------------------------------------------------
+Im Vorfeld wurden umfangreiche, kryptografisch auditierte Stresstests mit Bot-Schwärmen durchgeführt
+(40 bis 200 Bots via Node.js Bot-Worker). Die Messdaten zeigen:
+* 100 % flüssige Performance (exakt 20.0 TPS): Bis zu 110–120 Spieler gleichzeitig.
+* Realer Community-Betrieb (60 Spieler Peak): Der Server benötigt nur ca. 20 ms MSPT (Millisekunden
+  pro Tick). Da für 20 TPS ein Budget von 50 ms zur Verfügung steht, arbeitet der AMD Ryzen 5600GT
+  mit nur ca. 40 % Last und bietet massive Reserven für komplexe Redstone-Schaltungen und Farmen.
+* Taktverhalten des Ryzen 5600GT: Boostet im Performance-Governor dynamisch bis auf 4.63 GHz hoch.
+
+
+====================================================================================================
+KAPITEL 6: AUTHENTICATION, GOOGLE AUTHENTICATOR (TOTP) & CLOUDFLARE GATEWAY
+====================================================================================================
+
+Die externe Erreichbarkeit und Authentifizierung wird vollständig über den Container CT 100
+auf PVE 2 (`192.168.178.101`) abgewickelt.
+
+----------------------------------------------------------------------------------------------------
+6.1. TECHNISCHE STRUKTUR DES AUTH-PORTALS
+----------------------------------------------------------------------------------------------------
+* Verzeichnis:          `/opt/auth-portal/`
+* Start-Dienst:         `/etc/systemd/system/auth-portal.service` (Node.js App `server.js`)
+* Konfigurationsdatei:  `/opt/auth-portal/data/config.json`
+* Verwendete Module:    `express`, `cookie-parser`, `bcryptjs`, `otplib`, `qrcode`, `http-proxy-middleware`
+
+----------------------------------------------------------------------------------------------------
+6.2. DIE GOOGLE-AUTHENTICATOR-AUTHENTIFIZIERUNG IM DETAIL (RFC 6238 TOTP)
+----------------------------------------------------------------------------------------------------
+1. Setup & Schlüsselgenerierung:
+   - Bei der Initialisierung erzeugt `otplib` ein kryptografisches 32-Zeichen Base32-Secret:
+     Aktuelles Secret: `RYS5KSX6ELQUJE4W2T55UP2L2R23LKKL`
+   - Dieses Secret wird in eine Standard-TOTP-URI übersetzt:
+     `otpauth://totp/Proxmox%20Lab%20Gateway:admin?secret=RYS5KSX6ELQUJE4W2T55UP2L2R23LKKL&issuer=Proxmox%20Lab%20Gateway`
+   - Die Bibliothek `qrcode` rendert diese URI in ein Base64-PNG-Bild, das in der Web-GUI angezeigt wird.
+   - Der Benutzer scannt diesen QR-Code mit der Google Authenticator App (oder Aegis / 2FAS).
+
+2. Mathematische Berechnung des 6-stelligen Codes:
+   - Google Authenticator teilt die aktuelle Unix-Epochenzeit (Sekunden seit 1970) durch 30:
+     `T = floor(current_unix_time / 30)`
+   - Es wird ein HMAC-SHA1 Hash aus dem Secret und dem Zähler `T` gebildet:
+     `HMAC = HMAC-SHA1(Secret, T)`
+   - Durch Dynamic Truncation wird ein 4-Byte-Wert extrahiert und modulo 1.000.000 gerechnet.
+   - Das Resultat ist der exakte 6-stellige Einmalcode, der sich alle 30 Sekunden ändert.
+
+3. Validierung im Backend:
+   - Beim Login sendet der Client Passwort + den 6-stelligen TOTP-Code.
+   - `server.js` verifiziert:
+     * Bcrypt-Hash des Passworts (`bcrypt.compareSync`)
+     * TOTP-Token via `verifySync({ token: totpCode, secret: config.totpSecret })`
+     * Ein Zeitdrift-Fenster von +/- 1 Schritt (30 Sekunden) fängt geringe Uhrzeit-Abweichungen ab.
+
+4. Session-Verwaltung & Cookie:
+   - Nach erfolgreicher Validierung generiert der Server eine kryptografische Session-ID
+     und setzt das Cookie `pmx_session`.
+   - Alle nachfolgenden Anfragen an das Gateway prüfen dieses Cookie. Ohne gültiges Cookie
+     wird sofort auf `/` (Login) umgeleitet.
+
+----------------------------------------------------------------------------------------------------
+6.3. DYNAMISCHER REVERSE-PROXY & ZIEL-ROUTING
+----------------------------------------------------------------------------------------------------
+Das Auth-Portal schützt nicht nur Proxmox, sondern fungiert als zentrales Dashboard für alle Dienste:
+* Dienst `pve1`:   https://192.168.178.169:8006 (Proxmox VE Core Node)
+* Dienst `pve2`:   https://192.168.178.2:8006 (Proxmox VE Backup Node)
+* Dienst `pbs`:    https://192.168.178.2:8007 (Proxmox Backup Server)
+* Dienst `pelican`: http://192.168.178.94:80 (Pelican Game Panel)
+* Dienst `ha`:      http://192.168.178.25:8123 (Home Assistant OS)
+* Dienst `status`:  http://192.168.178.99:3000 (Observability Dashboard)
+
+Umschaltung:
+Über den Endpunkt `/gateway/switch/:target` setzt das Portal ein Cookie `pmx_active_target`.
+Die `http-proxy-middleware` leitet anschließend alle HTTP- und WebSocket-Verbindungen transparent
+an das gewählte Ziel weiter.
+Zusätzlich werden restriktive Header (`x-frame-options`, `content-security-policy`) gelöscht,
+damit die Konsolen (noVNC, xterm.js) im Portal-Viewer eingebettet werden können.
+
+----------------------------------------------------------------------------------------------------
+6.4. CLOUDFLARE ZERO TRUST TUNNEL
+----------------------------------------------------------------------------------------------------
+* Dienst: `cloudflared.service`
+* Befehl: `/usr/bin/cloudflared --no-autoupdate tunnel run --token-file /etc/cloudflared/token`
+* Funktionsweise:
+  Der Tunnel stellt von innen heraus eine verschlüsselte QUIC/UDP-Verbindung zu Cloudflare her.
+  Anfragen an die konfigurierte Domain werden über Cloudflare direkt in den Container CT 100
+  geleitet. Es sind keinerlei Portweiterleitungen auf der FRITZ!Box nötig!
+
+
+====================================================================================================
+KAPITEL 7: BACKUP-MANAGEMENT (PBS 4.2, VZDUMP-DUMP & ZUKUNFTS-INTEGRATION GOOGLE DRIVE)
+====================================================================================================
+
+----------------------------------------------------------------------------------------------------
+7.1. ZWEISTUFIGES BACKUP-VERFAHREN IM DETAIL
+----------------------------------------------------------------------------------------------------
+
+1. STUFE 1: PROXMOX BACKUP SERVER (PBS) — TÄGLICH 02:00 UHR
+   * Job-Name:          `pbs-daily-backup` (/etc/pve/jobs.cfg auf PVE 1)
+   * Ziel:              `pbs-backup` (PVE 2: 192.168.178.2:8007)
+   * Gesicherte VMs:    VM 100 (`dc-bot`), VM 104 (`Minecraftserver`),
+                        VM 106 (`homeassistant`), VM 110 (`pelican-server`)
+   * Funktionsweise:    Block-Level Inkrementell via QEMU Dirty-Bitmaps.
+                        Proxmox merkt sich im RAM, welche Festplattenblöcke seit dem letzten Backup
+                        verändert wurden. Es müssen nur diese Delta-Blöcke gelesen werden.
+   * Deduplizierung:    Daten werden in content-definierte 4-MB-Chunks (`.chunks/`) zerlegt
+                        und mit SHA-256 gehasht. Identische Chunks existieren physisch nur einmal!
+   * Retention:         `keep-daily=7, keep-weekly=4, keep-monthly=1`
+   * Garbage Collection: Täglich um 04:00 Uhr auf PVE 2 (`proxmox-backup-manager`).
+                        Markiert und löscht nicht mehr referenzierte Chunks.
+
+2. STUFE 2: LOKALER VZDUMP ZSTANDARD-DUMP — TÄGLICH 03:30 UHR
+   * Job-Name:          `local-hdd-daily`
+   * Ziel:              `hdd-backup` (/Hdd/backups auf ZFS Pool 'Hdd' auf PVE 1)
+   * Gesicherte VMs:    VM 100, 102, 104, 105, 106, 110
+   * Format:            Snapshot-Modus, Zstandard Kompression (`.vma.zst`)
+   * Speicheranalyse im Ordner `/Hdd/backups/dump/`:
+     - `vzdump-qemu-104-*.vma.zst`:  60.54 GB (36 % des Gesamtplatzes!)
+     - `vzdump-qemu-105-*.vma.zst`:   8.70 GB
+     - `vzdump-qemu-100-*.vma.zst`:   5.70 GB
+     - `vzdump-qemu-110-*.vma.zst`:   3.80 GB (Sehr kompakt)
+     - `vzdump-qemu-102-*.vma.zst`:   3.30 GB
+     - `vzdump-qemu-106-*.vma.zst`:   2.30 GB
+     Gesamtbelegung: 168 GB auf der HDD.
+
+----------------------------------------------------------------------------------------------------
+7.2. ZUKUNFTS-INTEGRATION: GOOGLE DRIVE OFFSITE-BACKUP
+----------------------------------------------------------------------------------------------------
+[WICHTIGE ANLEITUNG FÜR DIE GEPLANTE ZUKÜNFTIGE UMSETZUNG]
+
+Warum direkte Cloud-Anbindungen in Proxmox scheitern:
+Proxmox VE unterstützt von Haus aus kein Google Drive API. PBS arbeitet mit Hunderttausenden
+kleinen 4-MB-Dateien im Ordner `.chunks/`. Würde man diesen Ordner unverschlüsselt und unkomprimiert
+synchronisieren, würde Google Drive aufgrund von API-Rate-Limits (maximal ~2-3 Uploads pro Sekunde)
+blockieren oder Monate brauchen.
+
+DIE PROFESSIONELLE LÖSUNG: RCLONE MIT CRYPT-MODUL AUF PVE 2
+
+Schritt 1: Rclone auf PVE 2 installieren
+```bash
+ssh root@192.168.178.2
+apt update && apt install -y rclone
+```
+
+Schritt 2: Google Drive und Verschlüsselung einrichten
+```bash
+rclone config
+```
+1. Neues Remote erstellen: Name `gdrive`, Typ `drive`.
+   Den Authentifizierungs-Flow durchlaufen (Google OAuth Token).
+2. Zweites Remote erstellen (Verschlüsselungs-Layer!):
+   Name: `gdrive-crypt`
+   Typ: `crypt`
+   Remote: `gdrive:ProxmoxBackups/pbs-encrypted`
+   Passwort: Ein sicheres Master-Passwort vergeben (gut notieren!).
+   Dateinamen-Verschlüsselung: `standard`.
+   -> Dadurch sieht Google NIEMALS Dateinamen, VM-Inhalte oder unverschlüsselte Daten!
+
+Schritt 3: Automatisierungs-Skript erstellen
+Datei: `/usr/local/bin/sync-pbs-to-gdrive.sh`
+```bash
+#!/bin/bash
+set -e
+# Warte auf Abschluss der PBS Garbage Collection (startet um 04:00 Uhr)
+echo "[$(date)] Starte PBS Google Drive Sync..."
+
+# Synchronisiere den Datastore
+rclone sync /mnt/pbs-storage/ gdrive-crypt:/ \
+    --fast-list \
+    --transfers 4 \
+    --checkers 8 \
+    --bwlimit 15M \
+    --exclude "lost+found/**" \
+    --log-file=/var/log/rclone-gdrive.log \
+    --log-level INFO
+
+echo "[$(date)] Google Drive Sync erfolgreich beendet!"
+```
+Ausführbar machen: `chmod +x /usr/local/bin/sync-pbs-to-gdrive.sh`
+
+Schritt 4: Systemd-Timer für 04:30 Uhr morgens einrichten
+Datei: `/etc/systemd/system/pbs-to-gdrive.service`
+```ini
+[Unit]
+Description=Synchronize PBS Datastore to Google Drive
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/sync-pbs-to-gdrive.sh
+```
+
+Datei: `/etc/systemd/system/pbs-to-gdrive.timer`
+```ini
+[Unit]
+Description=Daily Google Drive Offsite Backup Timer
+
+[Timer]
+OnCalendar=*-*-* 04:30:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+```
+Timer aktivieren: `systemctl daemon-reload && systemctl enable --now pbs-to-gdrive.timer`
+
+Ergebnis:
+Jeden Morgen um 04:30 Uhr werden alle neuen deduplizierten Chunks vollständig verschlüsselt
+auf Google Drive gespiegelt. Das tägliche Upload-Volumen liegt typischerweise bei nur 200–800 MB!
+
+
+====================================================================================================
+KAPITEL 8: SICHERHEITSAUDIT & IDENTIFIZIERTE SCHWACHSTELLEN
+====================================================================================================
+
+Im Rahmen des Audits wurden folgende 6 kritische Sicherheitsaspekte identifiziert:
+
+1. KLARTEXT-PASSWORT IM AUTH-PORTAL:
+   In der Datei `/opt/auth-portal/data/config.json` steht:
+   `"plainDefault": "ep123-washout"`
+   Jeder, der Lesezugriff auf den Container CT 100 hat, kann das Master-Passwort im Klartext lesen.
+   -> Maßnahme: Diese Zeile sofort aus der JSON-Datei entfernen.
+
+2. PROXMOX NATIVE FIREWALL DEAKTIVIERT:
+   Auf beiden Hosts meldet `pve-firewall status`: `Status: disabled/running`.
+   Es existieren keinerlei Filterregeln. Sollte eine VM im Netzwerk kompromittiert werden,
+   kann sie alle Ports auf PVE 1 und PVE 2 uneingeschränkt scannen und attackieren.
+
+3. FEHLENDES 2FA AUF PROXMOX HYPERVISOR-EBENE:
+   Die Datei `/etc/pve/tfa.cfg` ist auf beiden Hosts leer. Das Google Authenticator 2FA greift
+   ausschließlich beim Zugriff über das Web-Portal. Wer im lokalen WLAN/LAN `https://192.168.178.169:8006`
+   aufruft, benötigt lediglich das Root-Passwort ohne jeden zweiten Faktor!
+
+4. ROOT SSH-LOGIN MIT PASSWORT:
+   Beide Nodes erlauben SSH-Logins mit `root` und Passwort. Kein Fail2ban aktiv.
+   -> Maßnahme: SSH-Keys hinterlegen und `PasswordAuthentication no` setzen.
+
+5. AUSHEBELUNG VON CLICKJACKING-SCHUTZ:
+   In `/opt/auth-portal/server.js` werden `x-frame-options` und `content-security-policy` gelöscht.
+   Dies ist nötig, um Proxmox im Iframe anzuzeigen, birgt aber das Risiko, dass bösartige Webseiten
+   die Session einbetten könnten.
+
+6. FLATCHES NETZWERK (FLAT NETWORK):
+   Minecraft-Traffic, Smart Home, Hypervisor-Management und Backup-Storage liegen ohne Isolation
+   im selben Subnetz 192.168.178.0/24.
+
+
+====================================================================================================
+KAPITEL 9: DETAILLIERTES VLAN- & NETZWERK-SEGMENTIERUNGSKONZEPT (SCHRITT FÜR SCHRITT)
+====================================================================================================
+
+----------------------------------------------------------------------------------------------------
+9.1. DAS ZIEL-NETZWERKDESIGN (4 GETRENNTE ZONEN)
+----------------------------------------------------------------------------------------------------
+
++---------+-------------------+-------------------+------------------------------------------+
+| VLAN-ID | Name              | Subnetz           | Zugewiesene Systeme & Berechtigungen     |
++---------+-------------------+-------------------+------------------------------------------+
+| VLAN 10 | MGMT (Management) | 10.10.10.0/24     | PVE 1 (10.10.10.2), PVE 2 (10.10.10.3),  |
+|         |                   |                   | PBS WebGUI (10.10.10.4).                 |
+|         |                   |                   | Streng isoliert! Zugriff NUR via VPN!    |
++---------+-------------------+-------------------+------------------------------------------+
+| VLAN 20 | DMZ / Gaming      | 10.10.20.0/24     | VM 110 (Pelican & Minecraft 10.10.20.10),|
+|         |                   |                   | CT 100 (Auth Portal & Cloudflare Tunnel).|
+|         |                   |                   | KEIN Zugriff auf VLAN 10, 30 oder 40!    |
++---------+-------------------+-------------------+------------------------------------------+
+| VLAN 30 | Smart Home & IoT  | 10.10.30.0/24     | VM 106 (Home Assistant 10.10.30.10),     |
+|         |                   |                   | WLAN-Kameras, Tado-Bridge, Hue.          |
+|         |                   |                   | Isoliert von Gaming & Hypervisoren.      |
++---------+-------------------+-------------------+------------------------------------------+
+| VLAN 40 | Storage & Backup  | 10.10.40.0/24     | Dediziertes Netz zwischen PVE 1 und      |
+|         |                   |                   | PVE 2 für PBS Backups. Kein Internet!    |
++---------+-------------------+-------------------+------------------------------------------+
+
+----------------------------------------------------------------------------------------------------
+9.2. WIE DAS MIT DER FRITZ!BOX FUNKTIONIERT
+----------------------------------------------------------------------------------------------------
+Problem: Die FRITZ!Box beherrscht kein 802.1Q VLAN-Tagging auf ihren LAN-Ports.
+
+Zwei funktionierende Lösungswege:
+
+WEG A: Günstiger Smart-Managed Switch (~25–35 Euro, z. B. TP-Link TL-SG108E)
+1. Port 1 des Switches verbindet die FRITZ!Box (Untagged VLAN 10 oder Default).
+2. Port 2 geht an PVE 1 (Trunk-Port: VLAN 10, 20, 30, 40 getaggt).
+3. Port 3 geht an PVE 2 (Trunk-Port: VLAN 10, 20, 30, 40 getaggt).
+4. Das Routing zwischen den VLANs übernimmt entweder der Switch (wenn L3-fähig)
+   oder eine Routing-VM.
+
+WEG B: Kostenlose OPNsense / pfSense VM auf PVE 1 (Ohne Zusatzhardware)
+1. Auf PVE 1 wird eine schlanke OPNsense VM installiert (2 vCPUs, 2 GB RAM).
+2. WAN-Interface: Hängt an `vmbr0` und bekommt per DHCP eine IP von der FRITZ!Box (192.168.178.x).
+3. LAN-Interface: Hängt an einer neuen virtuellen Bridge `vmbr1` (VLAN-Aware).
+4. OPNsense spannt intern die 4 VLANs auf, verteilt DHCP-Adressen und blockiert mit echten
+   Firewall-Regeln jeglichen unerlaubten Datenverkehr zwischen den Zonen!
+
+----------------------------------------------------------------------------------------------------
+9.3. KONFIGURATIONSBEISPIEL PROXMOX (/etc/network/interfaces)
+----------------------------------------------------------------------------------------------------
+So sieht die zukunftssichere Netzwerkkonfiguration auf PVE 1 aus:
+
+```text
+auto lo
+iface lo inet loopback
+
+iface nic0 inet manual
+
+# Die Haupt-Bridge wird VLAN-Aware geschaltet:
+auto vmbr0
+iface vmbr0 inet manual
+	bridge-ports nic0
+	bridge-stp off
+	bridge-fd 0
+	bridge-vlan-aware yes
+	bridge-vids 10 20 30 40
+
+# Virtuelles Interface für Hypervisor-Management in VLAN 10:
+auto vmbr0.10
+iface vmbr0.10 inet static
+	address 10.10.10.2/24
+	gateway 10.10.10.1
+	comment "PVE 1 Hypervisor Management"
+
+# Virtuelles Interface für High-Speed Backup in VLAN 40:
+auto vmbr0.40
+iface vmbr0.40 inet static
+	address 10.10.40.2/24
+	comment "PBS Backup Interconnect"
+```
+
+Zuweisung an VMs:
+Im Proxmox Web-Interface geht man in die jeweilige VM (z. B. VM 110) auf:
+`Hardware -> Network Device (net0) -> Edit -> VLAN Tag: 20`
+Sofort befindet sich die VM im isolierten Gaming-VLAN!
+
+
+====================================================================================================
+KAPITEL 10: CHRONOLOGISCHER MASSNAHMENPLAN (ROADMAP ZUR OPTIMIERUNG)
+====================================================================================================
+
+SOFORT-MASSNAHMEN (PRIORITÄT 1 - SCHNELLE GEWINNE):
+[ ] 1. In `/opt/auth-portal/data/config.json` auf CT 100 die Zeile `"plainDefault": "ep123-washout"` löschen.
+[ ] 2. VM 104 (`Minecraftserver`) herunterfahren und stoppen:
+       -> Gibt sofort 12 GB RAM auf PVE 1 frei!
+       -> Spart jede Nacht 61 GB Backup-Volumen und 15 Minuten Laufzeit!
+[ ] 3. Home Assistant klären:
+       -> VM 102 hat den ConBee II Zigbee USB-Stick gemountet.
+       -> Wenn VM 102 aktiv genutzt wird, VM 106 stoppen (spart 3 GB RAM und 32 GB SSD-Platz).
+[ ] 4. CT 100 (Auth-Portal) und CT 101 in den täglichen PBS-Backup-Job aufnehmen.
+
+MITTELFRISTIG (PRIORITÄT 2 - SICHERHEIT & CLOUD-OFFSITE):
+[ ] 5. Natives 2FA in Proxmox aktivieren (`Datacenter -> Two-Factor Authentication`).
+[ ] 6. SSH-Hardening: Passwort-Login via SSH auf beiden Hosts deaktivieren (`PasswordAuthentication no`).
+[ ] 7. Rclone auf PVE 2 installieren und automatischen Google Drive Sync für PBS einrichten (Kapitel 7.2).
+
+STRATEGISCH (PRIORITÄT 3 - NETZWERK-ISOLATION):
+[ ] 8. OPNsense VM oder Managed Switch beschaffen.
+[ ] 9. Proxmox-Bridge auf `bridge-vlan-aware yes` umstellen.
+[ ] 10. Minecraft-Server und Auth-Portal in VLAN 20 (DMZ) isolieren.
+
+====================================================================================================
+ENDE DER DETAIL-DOKUMENTATION
+Gespeichert in: Proxmox_Cluster_Documentation/VOLLSTAENDIGE_DETAIL_DOKUMENTATION.txt
+====================================================================================================
